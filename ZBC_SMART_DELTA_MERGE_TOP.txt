@@ -1,0 +1,153 @@
+*&---------------------------------------------------------------------*
+*& Report  ZBC_SMART_DELTA_MERGE_TOP
+*& SELECT tables which have maximum number
+*& of records in DELTA and do the following command:
+*&
+*&   MERGE DELTA OF <table_name> WITH PARAMETERS ('SMART_MERGE'='ON')
+*&   or
+*&   MERGE DELTA OF <table_name> WITH PARAMETERS ('FORCED_MERGE'='ON')
+*&---------------------------------------------------------------------*
+*&  Written by Nikolay Shitov (nikolay.shitov@eldorado.ru)
+*&
+*&  You can check in HANA:
+*&  select * from M_DELTA_MERGE_STATISTICS
+*&  where  DAYS_BETWEEN(start_time,NOW())=0 and motivation IN ('SMART','FORCE')
+*&  order by start_time desc
+*&---------------------------------------------------------------------*
+*&      HISTORY:
+*&      12.02.2016  version 0.9
+*&      06.04.2016  verstion 0.91  (delete table names of partitianed tables)
+*&      12.04.2016  verstion 0.92  (add commit work)
+*&---------------------------------------------------------------------*
+
+REPORT ZBC_SMART_DELTA_MERGE_TOP.
+* header
+DATA: x TYPE I,
+      h0(4)  TYPE c VALUE 'N   ',
+      h1(12) TYPE c VALUE 'TABLE_NAME',
+      h2(25) TYPE c VALUE 'RAW_RECORD_COUNT_IN_DELTA'.
+ TOP-OF-PAGE.
+  x = sy-colno.       POSITION x. WRITE h0.
+  x = sy-colno + 4.   POSITION x. WRITE h1.
+  x = sy-colno + 20.   POSITION x. WRITE h2.
+
+* =========  TYPES        ================================
+
+TYPES: BEGIN OF tCS_COL,
+          SCHEMA_NAME(256) TYPE C,
+          LOADED(5) TYPE C,
+          TABLE_NAME(256) TYPE C,
+          RECORD_COUNT TYPE P,
+          RAW_RECORD_COUNT_IN_DELTA TYPE P,
+          MEMORY_SIZE_IN_TOTAL TYPE P,
+          MEMORY_SIZE_IN_MAIN TYPE P,
+          MEMORY_SIZE_IN_DELTA TYPE P,
+       END OF tCS_COL.
+
+* =========local variables ================================
+
+DATA: gi_CS_COL TYPE STANDARD TABLE OF tCS_COL,
+      gs_CS_COL TYPE tCS_COL, "line
+      g_iCNT    TYPE I.  " count of the tables
+DATA: vsIN TYPE STRING, vsTxt TYPE STRING.
+DATA: VCOUNT TYPE I.
+
+*  ADBC FM
+DATA:  oSQL TYPE REF TO cl_sql_statement,  "ADBC class
+        oERR TYPE REF TO cx_sql_exception,
+        oRes TYPE REF TO cl_sql_result_set,
+        oCon TYPE REF TO cl_sql_connection,
+        oDat TYPE REF TO data,
+        exc_ref  TYPE REF TO cx_sy_native_sql_error,
+        error_text TYPE string.
+
+
+* =========SELECT-OPTIONS: ================================
+
+START-OF-SELECTION.
+
+PARAMETERS p_VIEW AS CHECKBOX DEFAULT 'X'.
+PARAMETERS p_force AS CHECKBOX.
+PARAMETERS p_mxROWS TYPE I DEFAULT 100.
+
+IF  p_mxROWS < 1 OR p_mxROWS > 100.
+    WRITE : / '1 >= Records <=100 m.b.!'.
+    EXIT.
+ENDIF.
+
+* ============ ADBC  ================================================================
+
+ TRY.
+
+ CREATE OBJECT oSQL.
+*
+* ============GET TABLES WHICH TO MERGE return: gi_CS_COL =============================
+* FROM M_CS_COLUMNS
+*  get tables with most largest rows in delta
+ DATA: c_mxROWS(5) TYPE C.
+  c_mxROWS = p_mxROWS.    " convert from I to char
+*
+* get top p_mxROWS column type  tables with maximum rows in DELTA storage
+*
+  CONCATENATE
+      'SELECT TOP ' c_mxROWS   "max 100
+      ' schema_name,LOADED,TABLE_NAME,RECORD_COUNT,'
+      ' RAW_RECORD_COUNT_IN_DELTA,MEMORY_SIZE_IN_TOTAL,MEMORY_SIZE_IN_MAIN,MEMORY_SIZE_IN_DELTA'
+      ' FROM M_CS_TABLES'
+      ' WHERE schema_name LIKE  ''SAP%'''
+      ' ORDER BY RAW_RECORD_COUNT_IN_DELTA Desc'
+       INTO vsIN.
+   oRes = oSQL->EXECUTE_QUERY( vsIN ) .
+*    gi_CS_COL
+   GET REFERENCE OF gi_CS_COL INTO oDat.
+   oRes->SET_PARAM_TABLE( oDat ) .
+   oRes->NEXT_PACKAGE( ).
+   oRes->CLOSE( ).
+*
+   DATA: sTBL TYPE STRING,  " Table name in current connection SCHEMA
+         sSQL TYPE STRING.  " formed HANA statemen
+   g_iCNT = 1.
+   LOOP AT gi_CS_COL INTO gs_CS_COL.  " circle for all tables with maximum counts of rows in DELTA storage
+    CONDENSE gs_CS_COL-TABLE_NAME.
+     write: / g_iCNT  LEFT-JUSTIFIED       UNDER h0,
+              gs_CS_COL-TABLE_NAME         UNDER h1,
+              gs_CS_COL-RAW_RECORD_COUNT_IN_DELTA LEFT-JUSTIFIED NO-GROUPING UNDER h2.
+     g_iCNT = g_iCNT + 1.
+   ENDLOOP.
+   SORT gi_CS_COL BY TABLE_NAME.
+   DELETE ADJACENT DUPLICATES FROM gi_CS_COL COMPARING TABLE_NAME.
+   SORT gi_CS_COL BY RAW_RECORD_COUNT_IN_DELTA DESCENDING.
+* ===========================================================
+   g_iCNT = 1.
+   LOOP AT gi_CS_COL INTO gs_CS_COL.  " circle for all tables with maximum counts of rows in DELTA storage
+    CONDENSE gs_CS_COL-TABLE_NAME.
+     IF p_VIEW <> 'X'.                " not to execute if test mode
+         sTBL = gs_CS_COL-TABLE_NAME.
+         IF p_force = 'X'.            " SMART or FORCED?
+            CONCATENATE 'MERGE DELTA OF "' sTBL '" WITH PARAMETERS(''FORCED_MERGE''=''ON'')' INTO sSQL.
+         ELSE.
+            CONCATENATE 'MERGE DELTA OF "' sTBL '" WITH PARAMETERS(''SMART_MERGE''=''ON'')' INTO sSQL.
+         ENDIF.
+*        CONCATENATE SY-DATUM(4) '.' SY-DATUM+4(2) '.' SY-DATUM+6(2)
+*                ' ' SY-UZEIT(2) ':' SY-UZEIT+2(2) ':' SY-UZEIT+4(2) '=>' sSQL INTO vsTxt.
+*        MESSAGE vsTxt TYPE 'I'.
+         IF SY-BATCH = 'X' .
+           MESSAGE sSQL TYPE 'I'.
+           commit WORK.
+         ENDIF.
+         oSQL->EXECUTE_DDL( sSQL ).
+     ENDIF.
+*     write: / g_iCNT  LEFT-JUSTIFIED       UNDER h0,
+*              gs_CS_COL-TABLE_NAME         UNDER h1,
+*              gs_CS_COL-RAW_RECORD_COUNT_IN_DELTA LEFT-JUSTIFIED NO-GROUPING UNDER h2.
+     g_iCNT = g_iCNT + 1.
+   ENDLOOP.
+  CATCH cx_sy_native_sql_error INTO exc_ref.
+    error_text = exc_ref->get_text( ).
+    MESSAGE error_text TYPE 'I'.
+    write: / error_text LEFT-JUSTIFIED UNDER h2.
+    EXIT.
+ ENDTRY.
+* ----------------------------------------------------------------------- *
+
+* start SMART DELTA MERGE
